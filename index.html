@@ -88,6 +88,15 @@ button.primary:hover{filter:brightness(1.08)}
 .md-body input[type=checkbox]{vertical-align:middle}
 [data-theme="dark"] .md-body pre,[data-theme="dark"] .md-body code{background:#161b22;color:#e6edf3}
 [data-theme="dark"] .hljs{background:#161b22;color:#e6edf3}
+#tableBar{
+  display:none;align-items:center;gap:4px;flex-wrap:wrap;
+  padding:5px 10px;border-top:1px solid var(--border);background:var(--bg-soft);
+}
+#tableBar.show{display:flex}
+#tableBar button{font-size:12px;padding:4px 7px}
+#tableBar .tb-label{font-size:12px;color:var(--muted);margin-right:2px}
+#tableBar .sep{width:1px;height:16px;background:var(--border);margin:0 3px}
+#tableBar .hint{font-size:11px;color:var(--muted);margin-left:auto}
 @media (max-width:860px){
   .main{flex-direction:column}
   #editorPane{flex:1 1 auto!important}
@@ -135,6 +144,20 @@ button.primary:hover{filter:brightness(1.08)}
 <div class="main">
   <div id="editorPane">
     <textarea id="editor" spellcheck="false" placeholder="在这里写 Markdown…  支持直接把 .md 文件拖进窗口"></textarea>
+    <div id="tableBar">
+      <span class="tb-label">表格</span>
+      <button data-tbl="row-up" title="在上方插入一行">+ 行 ↑</button>
+      <button data-tbl="row-down" title="在下方插入一行 (Enter)">+ 行 ↓</button>
+      <button data-tbl="col-left" title="在左侧插入一列">+ 列 ←</button>
+      <button data-tbl="col-right" title="在右侧插入一列">+ 列 →</button>
+      <button data-tbl="row-del" title="删除本行">− 行</button>
+      <button data-tbl="col-del" title="删除本列">− 列</button>
+      <span class="sep"></span>
+      <button data-tbl="al-left" title="本列左对齐">⇤</button>
+      <button data-tbl="al-center" title="本列居中">≡</button>
+      <button data-tbl="al-right" title="本列右对齐">⇥</button>
+      <span class="hint">Tab 下一格 · Shift+Tab 上一格 · Enter 新行</span>
+    </div>
   </div>
   <div id="gutter"></div>
   <div id="previewPane"><div class="md-body" id="preview"></div></div>
@@ -210,24 +233,26 @@ button.primary:hover{filter:brightness(1.08)}
 
   editor.addEventListener('input', function () { render(); updateCount(); scheduleSave(); });
 
-  /* ── 同步滚动（按滚动比例）── */
-  var syncing = false;
-  editor.addEventListener('scroll', function () {
-    if (syncing) return;
-    var max = editor.scrollHeight - editor.clientHeight;
-    if (max <= 0) return;
-    syncing = true;
-    previewPane.scrollTop = (editor.scrollTop / max) * (previewPane.scrollHeight - previewPane.clientHeight);
-    requestAnimationFrame(function () { syncing = false; });
-  });
-  previewPane.addEventListener('scroll', function () {
-    if (syncing) return;
-    var max = previewPane.scrollHeight - previewPane.clientHeight;
-    if (max <= 0) return;
-    syncing = true;
-    editor.scrollTop = (previewPane.scrollTop / max) * (editor.scrollHeight - editor.clientHeight);
-    requestAnimationFrame(function () { syncing = false; });
-  });
+  /* ── 同步滚动（按滚动比例，双向）──
+     用「谁在滚 + 时间锁」：滚动事件是异步派发的，
+     若用 rAF 立刻解锁，A 触发的 B 滚动会在解锁后才到达，
+     反过来把 A 拽回去 —— 表现为抖动或完全失效。 */
+  var syncLockSrc = null, syncLockUntil = 0;
+  function bindSync(src, dst, tag) {
+    src.addEventListener('scroll', function () {
+      var now = Date.now();
+      if (syncLockSrc && syncLockSrc !== tag && now < syncLockUntil) return;
+      syncLockSrc = tag;
+      syncLockUntil = now + 150;
+      var maxSrc = src.scrollHeight - src.clientHeight;
+      var maxDst = dst.scrollHeight - dst.clientHeight;
+      if (maxSrc > 0 && maxDst > 0) {
+        dst.scrollTop = (src.scrollTop / maxSrc) * maxDst;
+      }
+    });
+  }
+  bindSync(editor, previewPane, 'editor');
+  bindSync(previewPane, editor, 'preview');
 
   /* ── 工具栏插入 ── */
   var SNIPPETS = {
@@ -235,7 +260,7 @@ button.primary:hover{filter:brightness(1.08)}
     bold: ['**', '**'], italic: ['*', '*'], strike: ['~~', '~~'],
     ul: ['- ', ''], ol: ['1. ', ''], task: ['- [ ] ', ''], quote: ['> ', ''],
     code: ['```js\n', '\n```'], link: ['[', '](https://)'], hr: ['\n---\n', ''],
-    table: ['| 列 A | 列 B |\n| --- | --- |\n|  |  |\n', '']
+    table: ['| 列 A | 列 B | 列 C |\n| --- | --- | --- |\n|  |  |  |\n|  |  |  |\n', '']
   };
   function insert(before, after, placeholder) {
     var s = editor.selectionStart, e = editor.selectionEnd;
@@ -263,6 +288,269 @@ button.primary:hover{filter:brightness(1.08)}
     });
   });
 
+  /* ── 表格编辑：增删行列、对齐、单元格跳转 ── */
+  var tableBar = $('tableBar');
+
+  function rep(ch, n) { var s = ''; while (n-- > 0) s += ch; return s; }
+
+  // 等宽字体里 CJK 占两格，据此计算显示宽度才能对齐
+  function dispWidth(s) {
+    var w = 0;
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      w += (c >= 0x1100 && (
+        c <= 0x115f || c === 0x2329 || c === 0x232a ||
+        (c >= 0x2e80 && c <= 0xa4cf && c !== 0x303f) ||
+        (c >= 0xac00 && c <= 0xd7a3) || (c >= 0xf900 && c <= 0xfaff) ||
+        (c >= 0xfe30 && c <= 0xfe6f) || (c >= 0xff00 && c <= 0xff60) ||
+        (c >= 0xffe0 && c <= 0xffe6))) ? 2 : 1;
+    }
+    return w;
+  }
+
+  function tblSplitRow(line) {
+    var s = line.trim();
+    if (s.charAt(0) === '|') s = s.slice(1);
+    if (s.charAt(s.length - 1) === '|' && !/\\$/.test(s.slice(0, -1))) s = s.slice(0, -1);
+    s = s.replace(/\\\|/g, '\u0000');
+    return s.split('|').map(function (c) {
+      return c.replace(/\u0000/g, '\\|').trim();
+    });
+  }
+
+  function isSepLine(line) {
+    var s = line.trim();
+    if (s.indexOf('-') === -1 || s.indexOf('|') === -1) return false;
+    if (s.charAt(0) === '|') s = s.slice(1);
+    if (s.charAt(s.length - 1) === '|') s = s.slice(0, -1);
+    return s.split('|').every(function (p) { return /^\s*:?-{1,}:?\s*$/.test(p); });
+  }
+
+  function padCell(text, width, align) {
+    var pad = Math.max(0, width - dispWidth(text));
+    if (align === 'right') return rep(' ', pad) + text;
+    if (align === 'center') {
+      var l = Math.floor(pad / 2);
+      return rep(' ', l) + text + rep(' ', pad - l);
+    }
+    return text + rep(' ', pad);
+  }
+
+  function sepCell(align, w) {
+    var s;
+    if (align === 'center') s = ':' + rep('-', Math.max(1, w - 2)) + ':';
+    else if (align === 'right') s = rep('-', Math.max(2, w - 1)) + ':';
+    else s = rep('-', w);   // 左对齐保持默认的裸 ---，不改动原有写法
+    while (dispWidth(s) < w) s = (align === 'right') ? '-' + s : s + '-';
+    return s;
+  }
+
+  // rows[0]=表头  rows[1]=分隔行  rows[2..]=数据行
+  function formatRows(rows, aligns) {
+    var n = aligns.length, w = [], c, i;
+    for (c = 0; c < n; c++) {
+      w[c] = 0;
+      rows.forEach(function (r, ri) {
+        if (ri === 1) return;
+        var d = dispWidth(r[c] || '');
+        if (d > w[c]) w[c] = d;
+      });
+      if (w[c] < 3) w[c] = 3;
+    }
+    var out = [];
+    for (i = 0; i < rows.length; i++) {
+      if (i === 1) {
+        out.push('| ' + aligns.map(function (a, ci) { return sepCell(a, w[ci]); }).join(' | ') + ' |');
+      } else {
+        var cells = [];
+        for (c = 0; c < n; c++) cells.push(padCell(rows[i][c] || '', w[c], aligns[c]));
+        out.push('| ' + cells.join(' | ') + ' |');
+      }
+    }
+    return out;
+  }
+
+  // 定位光标所在的表格块；不在表格里返回 null
+  function tableContext() {
+    var v = editor.value, s = editor.selectionStart;
+    // 允许存在选区（操作后会自动选中单元格内容），一律以选区起点定位
+    var lineStartOff = v.lastIndexOf('\n', s - 1) + 1;
+    var lines = v.split('\n');
+    var lineIdx = v.slice(0, s).split('\n').length - 1;
+    if (lines[lineIdx].indexOf('|') === -1) return null;
+
+    var start = lineIdx;
+    while (start > 0 && lines[start - 1].indexOf('|') !== -1) start--;
+    var end = lineIdx;
+    while (end < lines.length - 1 && lines[end + 1].indexOf('|') !== -1) end++;
+    if (end - start < 1 || !isSepLine(lines[start + 1])) return null;
+
+    var rows = [];
+    for (var i = start; i <= end; i++) rows.push(tblSplitRow(lines[i]));
+    var ncol = rows[1].length;
+    if (!ncol) return null;
+    var aligns = rows[1].map(function (c2) {
+      var t = c2.trim();
+      var l = t.charAt(0) === ':', r = t.charAt(t.length - 1) === ':';
+      return (l && r) ? 'center' : (r ? 'right' : 'left');
+    });
+
+    // 当前列：数光标前有几个未转义的竖线
+    var pre = lines[lineIdx].slice(0, s - lineStartOff).replace(/\\\|/g, '\u0000');
+    if (pre.charAt(0) === '|') pre = pre.slice(1);
+    var col = pre.split('|').length - 1;
+    if (col < 0) col = 0;
+    if (col > ncol - 1) col = ncol - 1;
+
+    return {
+      lines: lines, start: start, end: end,
+      rowIdx: lineIdx - start, col: col, ncol: ncol,
+      rows: rows, aligns: aligns
+    };
+  }
+
+  // 返回 {start,end}：目标单元格内容在格式化后行内的字符区间
+  function cellRange(line, col) {
+    var c = -1, p1 = -1, p2 = line.length;
+    for (var i = 0; i < line.length; i++) {
+      if (line.charAt(i) === '|' && line.charAt(i - 1) !== '\\') {
+        c++;
+        if (c === col) p1 = i;
+        else if (c === col + 1) { p2 = i; break; }
+      }
+    }
+    if (p1 === -1) p1 = 0;
+    var s = p1 + 1, e = p2;
+    while (s < e && line.charAt(s) === ' ') s++;
+    while (e > s && line.charAt(e - 1) === ' ') e--;
+    return { start: s, end: e };
+  }
+
+  // 提交表格改动：mutator(rows, aligns, ctx) 返回 {rows, aligns, row, col}
+  function applyTable(mutator) {
+    var ctx = tableContext();
+    if (!ctx) return false;
+    var rows = ctx.rows.map(function (r) { return r.slice(); });
+    var aligns = ctx.aligns.slice();
+    var res = mutator(rows, aligns, ctx);
+    if (!res) return false;
+
+    var out = formatRows(res.rows, res.aligns);
+    var newLines = ctx.lines.slice(0, ctx.start)
+      .concat(out, ctx.lines.slice(ctx.end + 1));
+    editor.value = newLines.join('\n');
+
+    // 定位光标/选区到目标单元格
+    var targetRow = Math.max(0, Math.min(res.rows.length - 1, res.row));
+    var lineOff = 0;
+    for (var i = 0; i < ctx.start + targetRow; i++) lineOff += newLines[i].length + 1;
+    var r = cellRange(newLines[ctx.start + targetRow], Math.max(0, Math.min(res.aligns.length - 1, res.col)));
+    editor.focus();
+    editor.setSelectionRange(lineOff + r.start, lineOff + r.end);
+    render(); updateCount(); scheduleSave(); updateTableBar();
+    return true;
+  }
+
+  var TABLE_OPS = {
+    'row-down': function (rows, aligns, ctx) {
+      var at = Math.max(ctx.rowIdx + 1, 2);   // 表头行下方插入时跳过分隔行
+      rows.splice(at, 0, aligns.map(function () { return ''; }));
+      return { rows: rows, aligns: aligns, row: at, col: 0 };
+    },
+    'row-up': function (rows, aligns, ctx) {
+      if (ctx.rowIdx === 0) return null;      // 不能在表头上方插入
+      var at = Math.max(ctx.rowIdx, 2);
+      rows.splice(at, 0, aligns.map(function () { return ''; }));
+      return { rows: rows, aligns: aligns, row: at, col: ctx.col };
+    },
+    'col-right': function (rows, aligns, ctx) {
+      var c = ctx.col + 1;
+      rows.forEach(function (r) { r.splice(c, 0, ''); });
+      aligns.splice(c, 0, 'left');
+      return { rows: rows, aligns: aligns, row: ctx.rowIdx, col: c };
+    },
+    'col-left': function (rows, aligns, ctx) {
+      var c = ctx.col;
+      rows.forEach(function (r) { r.splice(c, 0, ''); });
+      aligns.splice(c, 0, 'left');
+      return { rows: rows, aligns: aligns, row: ctx.rowIdx, col: c };
+    },
+    'row-del': function (rows, aligns, ctx) {
+      if (ctx.rowIdx === 0 || ctx.rowIdx === 1) return null;   // 表头/分隔行不可删
+      if (rows.length <= 3) return null;                       // 至少留一行数据
+      rows.splice(ctx.rowIdx, 1);
+      var row = Math.min(ctx.rowIdx, rows.length - 1);
+      return { rows: rows, aligns: aligns, row: row === 1 ? 2 : row, col: ctx.col };
+    },
+    'col-del': function (rows, aligns, ctx) {
+      if (aligns.length <= 1) return null;
+      var c = ctx.col;
+      rows.forEach(function (r) { r.splice(c, 1); });
+      aligns.splice(c, 1);
+      return { rows: rows, aligns: aligns, row: ctx.rowIdx, col: Math.max(0, c - 1) };
+    },
+    'al-left': function (rows, aligns, ctx) { aligns[ctx.col] = 'left'; return { rows: rows, aligns: aligns, row: ctx.rowIdx, col: ctx.col }; },
+    'al-center': function (rows, aligns, ctx) { aligns[ctx.col] = 'center'; return { rows: rows, aligns: aligns, row: ctx.rowIdx, col: ctx.col }; },
+    'al-right': function (rows, aligns, ctx) { aligns[ctx.col] = 'right'; return { rows: rows, aligns: aligns, row: ctx.rowIdx, col: ctx.col }; }
+  };
+
+  function updateTableBar() {
+    var inTbl = !!tableContext();
+    tableBar.classList.toggle('show', inTbl);
+  }
+  document.querySelectorAll('[data-tbl]').forEach(function (btn) {
+    btn.addEventListener('mousedown', function (ev) { ev.preventDefault(); }); // 防止输入框失焦
+    btn.addEventListener('click', function () {
+      var op = TABLE_OPS[btn.dataset.tbl];
+      if (op) applyTable(op);
+    });
+  });
+  ['input', 'click', 'keyup'].forEach(function (ev) {
+    editor.addEventListener(ev, updateTableBar);
+  });
+
+  /* ── 回车自动延续列表（有序编号递增 / 无序 / 任务 / 引用）── */
+  var LIST_RE = [
+    // 任务列表：- [ ] 或 - [x]（必须排在无序列表前面，否则会被 "- " 抢先匹配）
+    { re: /^(\s*)([-*+]\s+\[[ xX]\]\s+)/, next: function (m) { return m[1] + m[2].replace(/\[[xX]\]/, '[ ]'); } },
+    // 无序列表
+    { re: /^(\s*)([-*+]\s+)/, next: function (m) { return m[0]; } },
+    // 有序列表：支持 1. 和 1)
+    { re: /^(\s*)(\d+)([.)])(\s+)/, next: function (m) { return m[1] + (parseInt(m[2], 10) + 1) + m[3] + m[4]; } },
+    // 引用
+    { re: /^(\s*)(>\s?)/, next: function (m) { return m[1] + '> '; } }
+  ];
+
+  function continueList() {
+    var v = editor.value, s = editor.selectionStart, e = editor.selectionEnd;
+    if (s !== e) return false;                      // 有选区时不接管
+    var lineStart = v.lastIndexOf('\n', s - 1) + 1;
+    var head = v.slice(lineStart, s);               // 光标前的本行内容
+    var rest = v.slice(s);
+    var restEnd = rest.indexOf('\n');
+    var tail = restEnd === -1 ? rest : rest.slice(0, restEnd);
+    if (tail.trim() !== '') return false;           // 光标不在行尾则不接管
+
+    for (var i = 0; i < LIST_RE.length; i++) {
+      var m = head.match(LIST_RE[i].re);
+      if (!m) continue;
+
+      // 空列表项上回车 → 删掉标记、退出列表
+      if (head === m[0]) {
+        editor.value = v.slice(0, lineStart) + '\n' + rest;
+        editor.setSelectionRange(lineStart + 1, lineStart + 1);
+        return true;
+      }
+
+      var ins = '\n' + LIST_RE[i].next(m);
+      editor.value = v.slice(0, s) + ins + rest;
+      var pos = s + ins.length;
+      editor.setSelectionRange(pos, pos);
+      return true;
+    }
+    return false;
+  }
+
   /* ── 编辑器快捷键 ── */
   editor.addEventListener('keydown', function (ev) {
     var meta = ev.ctrlKey || ev.metaKey;
@@ -272,7 +560,35 @@ button.primary:hover{filter:brightness(1.08)}
     else if (meta && ev.key.toLowerCase() === 'k') { ev.preventDefault(); insert('[', '](https://)', '链接文字'); }
     else if (ev.key === 'Tab') {
       ev.preventDefault();
-      insert('  ', '', '');
+      // 表格内：Tab / Shift+Tab 在单元格间跳转
+      if (!applyTable(function (rows, aligns, ctx) {
+        var lastRow = rows.length - 1, lastCol = aligns.length - 1;
+        var r = ctx.rowIdx, c = ctx.col;
+        if (ev.shiftKey) {
+          c--;
+          if (c < 0) { c = lastCol; r--; }
+          if (r < 2) { r = lastRow; c = lastCol; }   // 从表头回绕到最后一格
+        } else {
+          c++;
+          if (c > lastCol) { c = 0; r++; }
+          if (r > lastRow) {                          // 末行末列 → 自动新增一行
+            rows.push(aligns.map(function () { return ''; }));
+            r = rows.length - 1; c = 0;
+          }
+        }
+        if (r === 1) r = ev.shiftKey ? lastRow : 2;   // 跳过分隔行
+        return { rows: rows, aligns: aligns, row: r, col: c };
+      })) {
+        insert('  ', '', '');                          // 表格外：缩进两空格
+      }
+    } else if (ev.key === 'Enter' && !ev.shiftKey && !meta && !ev.altKey) {
+      // 表格内回车 → 新增一行；否则走列表延续
+      if (applyTable(TABLE_OPS['row-down'])) {
+        ev.preventDefault();
+      } else if (continueList()) {
+        ev.preventDefault();
+        render(); updateCount(); scheduleSave();
+      }
     }
   });
 
@@ -364,7 +680,17 @@ button.primary:hover{filter:brightness(1.08)}
     '- `Ctrl/⌘ + B / I / K` — 加粗 / 斜体 / 插链接\n' +
     '- 顶部工具栏可一键插入标题、列表、表格、代码块\n' +
     '- 把 `.md` 文件直接拖进窗口即可导入\n' +
-    '- 中间的分隔条可以拖动，调整左右比例\n\n' +
+    '- 中间的分隔条可以拖动，调整左右比例\n' +
+    '- 左右两栏**滚动同步**\n\n' +
+    '## 列表会自动延续\n\n' +
+    '回车即可接着上一条写，有序列表编号自动递增；空条目上再按一次回车退出列表。\n\n' +
+    '1. 第一项\n' +
+    '2. 第二项\n\n' +
+    '- [x] 已完成事项\n' +
+    '- [ ] 待办事项\n\n' +
+    '## 表格可以随意增删\n\n' +
+    '把光标放进表格里，底部会出现一行表格工具：加行、加列、删行、删列、改对齐。\n' +
+    '也可以直接用键盘 —— `Tab` 跳到下一格（末格自动续一行）、`Enter` 新增一行。\n\n' +
     '## 表格\n\n' +
     '| 能力 | 是否支持 |\n| --- | --- |\n| 实时预览 | ✅ |\n| 导出 .md | ✅ |\n| 导出 HTML | ✅ |\n\n' +
     '## 代码\n\n```js\nconst hello = (name) => `Hi, ${name}`;\nconsole.log(hello("Markdown"));\n```\n\n' +
